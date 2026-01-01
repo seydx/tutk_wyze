@@ -283,7 +283,7 @@ Offset    Size  Field          Value/Description
 [20-23]   4     RandomID       4 random bytes
 [24-279]  256   Username       "admin" (null-padded)
 [280-535] 256   Password       ENR string (null-padded)
-[536-539] 4     Resend         0x00000000
+[536-539] 4     Resend         0=disabled, 1=enabled (see 9.6)
 [540-543] 4     SecurityMode   0x00000002 (AV_SECURITY_AUTO)
 [544-547] 4     AuthType       0x00000000 (PASSWORD)
 [548-551] 4     SyncRecvData   0x00000000
@@ -576,6 +576,102 @@ The value at offset [14-15] (28-byte) or [22-23] (36-byte) has dual meaning:
 | Otherwise | Actual packet index within frame |
 
 **Note:** 0x0028 hex = 40 decimal. For non-End packets, this could be pkt_idx=40.
+
+### 9.6 Resend Mode
+
+The `resend` field in the AV Login packet (offset [536-539]) controls the packet format used for streaming. Setting this value determines whether retransmission support is enabled:
+
+#### resend=0: Direct Format (Simpler)
+
+```
+[channel][frameType][version 2B][seq 2B]...[payload]
+```
+
+Example:
+```
+0000: 05 00 0b 00 6d 00 81 4e 05 00 63 00 86 00 00 00
+      ^^ ^^
+      |  frameType=0x00 (continuation)
+      channel=0x05 (I-Video)
+```
+
+**Characteristics:**
+- First byte is channel: 0x03=Audio, 0x05=I-Video, 0x07=P-Video
+- No 0x0c wrapper overhead
+- No Frame Index packets (1080 bytes)
+- Simpler parsing, less bandwidth
+
+#### resend=1: Wrapped Format (With Resend Support)
+
+```
+[0x0c][variant][version 2B][seq 2B]...[channel at offset 16/24]
+```
+
+Example:
+```
+0000: 0c 05 0b 00 e4 00 64 00 0a 00 00 14 01 00 00 00
+      ^^ ^^
+      |  variant=0x05
+      0x0c wrapper (resend marker)
+0010: 07 01 c8 00 01 00 28 00 ...
+      ^^
+      channel=0x07 (P-Video) at offset 16
+```
+
+**Characteristics:**
+- First byte is always 0x0c (resend wrapper)
+- Channel byte at offset 16 (variant < 0x08) or 24 (variant >= 0x08)
+- Additional 1080-byte Frame Index packets sent periodically
+- Enables packet retransmission for reliable delivery
+
+#### Header Size Rule
+
+| Variant | Header Size | Channel Offset |
+|---------|-------------|----------------|
+| < 0x08 | 36 bytes | 16 |
+| >= 0x08 | 44 bytes | 24 |
+
+### 9.7 Frame Index Packets (Inner Byte 0x0c)
+
+When using `resend=1`, the camera sends periodic **Frame Index** packets (also called Resend Buffer Status).
+
+#### Packet Structure (1080 bytes total)
+
+```
+OUTER HEADER (16 bytes):
+0000: 0c 00 0b 00 [seq 2B] [sub 2B] [counter 2B] 14 14 01 00 00 00
+      ^^^^                                       ^^^^^
+      cmd=0x0c                                   magic
+
+INNER HEADER (20 bytes):
+0010: 0c 00 00 00 00 00 00 00 14 04 00 00 00 00 00 00 00 00 00 00
+      ^^^^                   ^^^^^
+      inner cmd              payload_size = 0x0414 = 1044 bytes
+
+PAYLOAD DATA (starting at offset 0x20):
+0020: 00 00 00 00          // 4 zero bytes
+0024: [ch] [ft]            // channel + frame type
+0026: [data 2B] [data 2B]  // varies by packet type
+...
+0030: [prev_frame 4B LE]   // previous frame number
+0034: [curr_frame 4B LE]   // current frame number
+```
+
+#### Key Offsets
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0x24 (36) | 1 | Channel (0x05=I-Video, 0x07=P-Video) |
+| 0x25 (37) | 1 | Frame type |
+| 0x30 (48) | 4 | Previous frame number (LE) |
+| 0x34 (52) | 4 | Current frame number (LE) |
+
+#### Packet Types
+
+| Channel | Description |
+|---------|-------------|
+| 0x05 | I-Video Frame Index - consecutive frame numbers for GOP sync |
+| 0x07 | P-Video - buffer window status (oldest/newest buffered frame) |
 
 ---
 
