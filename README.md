@@ -1,254 +1,113 @@
 # TUTK/IOTC Protocol Reference for Wyze Cameras
 
-This document provides detailed technical specifications for implementing native Wyze camera streaming without relying on ThroughTek's proprietary TUTK SDK. It covers the complete protocol stack from cloud authentication through encrypted P2P streaming, enabling direct access to Wyze camera video and audio feeds.
+This document provides a complete reverse-engineering reference for the ThroughTek TUTK/IOTC protocol as used by Wyze cameras. It covers the entire protocol stack from UDP transport through encrypted P2P streaming, enabling implementation of native Wyze camera streaming without the proprietary TUTK SDK.
 
 ## Table of Contents
 
-1. [Overview](#1-overview)
-2. [Architecture](#2-architecture)
-3. [Cloud API](#3-cloud-api)
-4. [IOTC Discovery & Session](#4-iotc-discovery--session)
-5. [DTLS Encryption](#5-dtls-encryption)
+1. [Protocol Stack Overview](#1-protocol-stack-overview)
+2. [Encryption Layers](#2-encryption-layers)
+3. [Connection Flow](#3-connection-flow)
+4. [IOTC Packet Structures](#4-iotc-packet-structures)
+5. [DTLS Transport](#5-dtls-transport)
 6. [AV Login](#6-av-login)
 7. [K-Command Authentication](#7-k-command-authentication)
-8. [AV Streaming Protocol](#8-av-streaming-protocol)
-9. [FRAMEINFO Structure](#9-frameinfo-structure)
-10. [Codec IDs & Sample Rates](#10-codec-ids--sample-rates)
-11. [RTP Timestamp Calculation](#11-rtp-timestamp-calculation)
-12. [Intercom](#12-intercom)
-13. [Error Codes](#13-error-codes)
-14. [IOTYPE Constants](#14-iotype-constants)
-15. [Cryptography](#15-cryptography)
-16. [SDK Constants Reference](#16-sdk-constants-reference)
-17. [Low-Level Frame Formats](#17-low-level-frame-formats)
+8. [K-Command Control](#8-k-command-control)
+9. [AV Frame Structure](#9-av-frame-structure)
+10. [FRAMEINFO Structure](#10-frameinfo-structure)
+11. [Codec Reference](#11-codec-reference)
+12. [Two-Way Audio (Backchannel)](#12-two-way-audio-backchannel)
+13. [Frame Reassembly](#13-frame-reassembly)
+14. [Wyze Cloud API](#14-wyze-cloud-api)
+15. [Cryptography Details](#15-cryptography-details)
+16. [Constants Reference](#16-constants-reference)
 
 ---
 
-## 1. Overview
-
-Wyze cameras use ThroughTek's TUTK/IOTC SDK for P2P communication. This documentation reverse-engineers the protocol to enable streaming video/audio without the proprietary native SDK library.
-
-### Protocol Stack
+## 1. Protocol Stack Overview
 
 ```
-+----------------------------------------------------------+
-|                   Wyze Cloud API                         |
-|  Authentication, camera info (UID, ENR, MAC)             |
-+----------------------------------------------------------+
-                          |
-+----------------------------------------------------------+
-|                  K-Command Auth (K10000-K10003)          |
-|  Proprietary XXTEA challenge-response                    |
-+----------------------------------------------------------+
-                          |
-+----------------------------------------------------------+
-|                    AV Streaming                          |
-|  Video (H.264/H.265), Audio (AAC/G.711/Opus)             |
-+----------------------------------------------------------+
-                          |
-+----------------------------------------------------------+
-|              DTLS 1.2 (ChaCha20-Poly1305)                |
-|  PSK = SHA256(ENR)                                       |
-+----------------------------------------------------------+
-                          |
-+----------------------------------------------------------+
-|                     IOTC Session                         |
-|  Discovery (0x0601), Session (0x0402)                    |
-+----------------------------------------------------------+
-                          |
-+----------------------------------------------------------+
-|             TransCode ("Charlie") Cipher                 |
-|  Obfuscation for IOTC packets                            |
-+----------------------------------------------------------+
-                          |
-+----------------------------------------------------------+
-|                        UDP                               |
-|  Port 32761 (default)                                    |
-+----------------------------------------------------------+
+┌─────────────────────────────────────────────────────────────┐
+│                    Application Layer                        │
+│         Video (H.264/H.265) + Audio (AAC/G.711/Opus)        │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────┐
+│                    AV Frame Layer                           │
+│    Frame Types, Channels, FRAMEINFO, Packet Reassembly      │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────┐
+│                K-Command Authentication                     │
+│      K10000-K10003 (XXTEA Challenge-Response)               │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────┐
+│                    AV Login Layer                           │
+│              Credentials + Capabilities Exchange            │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────┐
+│                 DTLS 1.2 Encryption                         │
+│      PSK = SHA256(ENR), ChaCha20-Poly1305 AEAD              │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────┐
+│                    IOTC Session                             │
+│         Discovery (0x0601) + Session Setup (0x0402)         │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────┐
+│              TransCode Cipher ("Charlie")                   │
+│            XOR + Bit Rotation Obfuscation                   │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────┐
+│                      UDP Transport                          │
+│                    Port 32761 (default)                     │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ### Required Credentials
 
 | Parameter | Description | Source |
 |-----------|-------------|--------|
-| UID | Device P2P ID | Wyze Cloud API |
-| ENR | 16+ byte encryption key | Wyze Cloud API |
+| UID | Device P2P identifier (20 chars) | Wyze Cloud API |
+| ENR | Encryption key (16+ bytes) | Wyze Cloud API |
 | MAC | Device MAC address | Wyze Cloud API |
 | AuthKey | SHA256(ENR + MAC)[:6] in Base64 | Calculated |
 
-### Supported Camera Models
-
-All Wyze cameras using TUTK/IOTC SDK with DTLS support (current firmware).
-
----
-
-## 2. Architecture
-
-### Connection Flow
+### Credential Derivation
 
 ```
-Client                                             Camera
-   |                                                  |
-   |  ================ IOTC Discovery =============== |
-   |                                                  |
-   |  DISCO broadcast (0x0601) ---------------------> |
-   |  <---------------------- DISCO response (0x0602) |
-   |  DISCO direct (0x0601) ------------------------> |
-   |                                                  |
-   |  ================= IOTC Session ================ |
-   |                                                  |
-   |  Session Request (0x0402) ---------------------> |
-   |  <-------------------- Session Response (0x0404) |
-   |                                                  |
-   |  ================ DTLS Handshake =============== |
-   |                                                  |
-   |  ClientHello (wrapped in DATA_TX) -------------> |
-   |  <------------------------ ServerHello + KeyExch |
-   |  ClientKeyExchange + Finished -----------------> |
-   |  <------------------------------ DTLS Finished   |
-   |                                                  |
-   |  =================== AV Login ================== |
-   |                                                  |
-   |  AV Login #1 (magic=0x0000) -------------------> |
-   |  AV Login #2 (magic=0x2000) -------------------> |
-   |  <----------------------- AV Login Resp (0x2100) |
-   |  ACK (0x0009) ---------------------------------> |
-   |                                                  |
-   |  ==================== K-Auth =================== |
-   |                                                  |
-   |  K10000 (Auth Request) ------------------------> |
-   |  <--------------------------- K10001 (Challenge) |
-   |  ACK (0x0009) ---------------------------------> |
-   |  K10002 (Challenge Response) ------------------> |
-   |  <------------------------- K10003 (Auth Result) |
-   |  ACK (0x0009) ---------------------------------> |
-   |                                                  |
-   |  ================== Streaming ================== |
-   |                                                  |
-   |  <--------------------------- Video/Audio frames |
-   |  <--------------------------- Video/Audio frames |
-   |                       ...                        |
-```
+AuthKey = Base64(SHA256(ENR + uppercase(MAC))[0:6])
+         with substitutions: '+' → 'Z', '/' → '9', '=' → 'A'
 
-### Implementation Mapping
-
-| SDK Function | Implementation |
-|--------------|----------------|
-| `IOTC_Connect_ByUID` | Discovery + Session setup |
-| `avClientStartEx` | AV Login sequence |
-| `avSendIOCtrl` | Send IOCTL command |
-| `avRecvIOCtrl` | Receive IOCTL response |
-| `avRecvFrameData2` | Read AV packet |
-| K-Auth sequence | K10000-K10003 exchange |
-
----
-
-## 3. Cloud API
-
-### Authentication
-
-Wyze uses triple-MD5 password hashing:
-
-```go
-func hashPassword(password string) string {
-    encoded := password
-    for i := 0; i < 3; i++ {
-        hash := md5.Sum([]byte(encoded))
-        encoded = hex.EncodeToString(hash[:])
-    }
-    return encoded
-}
-```
-
-### Endpoints
-
-| Endpoint | Purpose |
-|----------|---------|
-| `https://auth-prod.api.wyze.com/api/user/login` | Authentication |
-| `https://api.wyzecam.com/app/v2/home_page/get_object_list` | Device list |
-| `https://api.wyzecam.com/app/v2/device/get_iotc_info` | P2P connection info |
-
-### Camera Info Response
-
-```json
-{
-  "mac": "80482C4CF472",
-  "enr": "aKzdqckqZ8HUHFe5...",
-  "p2p_id": "HSBJYB5HSETGCDWD111A",
-  "ip": "192.168.1.100",
-  "dtls": 1
-}
+PSK = SHA256(ENR)  // 32 bytes for DTLS
 ```
 
 ---
 
-## 4. IOTC Discovery & Session
+## 2. Encryption Layers
 
-### Discovery Protocol
+The protocol uses three distinct encryption layers:
 
-Discovery uses UDP broadcast on port 32761.
+### Layer 1: TransCode ("Charlie" Cipher)
 
-#### DISCO Request (0x0601)
+Applied to all IOTC Discovery and Session packets before UDP transmission.
 
-```
-Offset  Size  Field           Description
-------  ----  -----           -----------
-0-3     4     Header          0x04 0x02 0x1a 0x02
-4-5     2     BodySize        72 (0x0048)
-8-9     2     Command         0x0601 (CmdDiscoReq)
-10-11   2     SubCommand      0x0021
-16-35   20    UID             Device UID (null-padded)
-52-59   8     RandomID        8 random bytes
-60      1     Stage           1=broadcast, 2=direct
-72-79   8     AuthKey         8-byte auth key
-```
+**Algorithm:**
+- XOR with magic string: `"Charlie is the designer of P2P!!"`
+- 32-bit left rotation on each block
+- Byte permutation/swapping
 
-#### Discovery Encryption (TransCode)
+**When Applied:**
+- Disco Request/Response (0x0601/0x0602)
+- Session Request/Response (0x0402/0x0404)
+- Data TX/RX wrappers (0x0407/0x0408)
 
-All IOTC packets are obfuscated using the "Charlie" cipher:
+### Layer 2: DTLS 1.2
 
-```go
-const charlie = "Charlie is the designer of P2P!!"
-
-func TransCodePartial(src []byte) []byte {
-    // XOR with charlie string
-    // Bit rotations
-    // Byte swapping
-}
-```
-
-### Session Setup (0x0402)
-
-After discovery, establish a session:
-
-```
-Offset  Size  Field           Description
-------  ----  -----           -----------
-0-3     4     Header          0x04 0x02 0x1a 0x02
-4-5     2     BodySize        36 (0x0024)
-8-9     2     Command         0x0402 (CmdSessionReq)
-16-35   20    UID             Device UID
-36-43   8     RandomID        Same as DISCO
-48-51   4     Timestamp       Unix timestamp
-```
-
-Camera responds with 0x0404 confirming session.
-
----
-
-## 5. DTLS Encryption
-
-### PSK Derivation
-
-```go
-// PSK = SHA256(ENR)
-func CalculatePSK(enr string) []byte {
-    hash := sha256.Sum256([]byte(enr))
-    return hash[:]
-}
-```
-
-### DTLS Parameters
+Encrypts all data after session establishment.
 
 | Parameter | Value |
 |-----------|-------|
@@ -258,438 +117,551 @@ func CalculatePSK(enr string) []byte {
 | PSK | SHA256(ENR) - 32 bytes |
 | Curve | X25519 |
 
-### DTLS Transport Wrapping
+### Layer 3: XXTEA
 
-DTLS records are wrapped in IOTC DATA_TX (0x0407) packets:
+Used for K-Command challenge-response authentication.
+
+| Status | Key Derivation |
+|--------|----------------|
+| 1 (Default) | Key = `"FFFFFFFFFFFFFFFF"` (16 x 0xFF) |
+| 3 (ENR16) | Key = ENR[0:16] |
+| 6 (ENR32) | Double: decrypt with ENR[0:16], then with ENR[16:32] |
+
+---
+
+## 3. Connection Flow
 
 ```
-Offset  Size  Field           Description
-------  ----  -----           -----------
-0-15    16    IOTC Header     Standard IOTC frame header
-16-27   12    SubHeader       Session info
-28+     var   DTLS Record     Encrypted DTLS data
+Client                                                 Camera
+   │                                                      │
+   │  ═══════════ Phase 1: IOTC Discovery ═══════════════ │
+   │                                                      │
+   │  Disco Stage 1 (0x0601, broadcast) ───────────────►  │
+   │  ◄───────────────────────  Disco Response (0x0602)   │
+   │  Disco Stage 2 (0x0601, direct) ──────────────────►  │
+   │                                                      │
+   │  ═══════════ Phase 2: IOTC Session ═════════════════ │
+   │                                                      │
+   │  Session Request (0x0402) ────────────────────────►  │
+   │  ◄─────────────────────  Session Response (0x0404)   │
+   │                                                      │
+   │  ═══════════ Phase 3: DTLS Handshake ═══════════════ │
+   │                                                      │
+   │  ClientHello (in DATA_TX 0x0407) ─────────────────►  │
+   │  ◄─────────────────────  ServerHello + KeyExchange   │
+   │  ClientKeyExchange + Finished ────────────────────►  │
+   │  ◄─────────────────────────────────  DTLS Finished   │
+   │                                                      │
+   │  ═══════════ Phase 4: AV Login ═════════════════════ │
+   │                                                      │
+   │  AV Login #1 (magic=0x0000) ──────────────────────►  │
+   │  AV Login #2 (magic=0x2000) ──────────────────────►  │
+   │  ◄─────────────────────  AV Login Response (0x2100)  │
+   │  ACK (0x0009) ────────────────────────────────────►  │
+   │                                                      │
+   │  ═══════════ Phase 5: K-Authentication ═════════════ │
+   │                                                      │
+   │  K10000 (Auth Request) ───────────────────────────►  │
+   │  ◄─────────────────────────  K10001 (Challenge 16B)  │
+   │  ACK (0x0009) ────────────────────────────────────►  │
+   │  K10002 (Response 38B) ───────────────────────────►  │
+   │  ◄─────────────────────────  K10003 (Result, JSON)   │
+   │  ACK (0x0009) ────────────────────────────────────►  │
+   │                                                      │
+   │  ═══════════ Phase 6: Streaming ════════════════════ │
+   │                                                      │
+   │  ◄───────────────────────────────  Video/Audio Data  │
+   │  ◄───────────────────────────────  Video/Audio Data  │
+   │                       ...                            │
 ```
 
-The transport layer strips this wrapper before passing to the DTLS implementation.
+---
+
+## 4. IOTC Packet Structures
+
+### 4.1 IOTC Frame Header (16 bytes)
+
+All IOTC packets share this outer wrapper:
+
+```
+Offset  Size  Field        Description
+──────────────────────────────────────────────────────────────
+[0]     1     Marker1      Always 0x04
+[1]     1     Marker2      Always 0x02
+[2]     1     Marker3      Always 0x1A
+[3]     1     Mode         0x02 (Disco), 0x0A (Session), 0x0B (Data)
+[4-5]   2     BodySize     Body length in bytes (LE)
+[6-7]   2     Sequence     Packet sequence number (LE)
+[8-9]   2     Command      Command ID (LE)
+[10-11] 2     Flags        Command-specific flags (LE)
+[12-15] 4     RandomID     Random identifier or metadata
+```
+
+### 4.2 Disco Request (0x0601) - 80 bytes total
+
+```
+Offset  Size  Field        Description
+──────────────────────────────────────────────────────────────
+[0-15]  16    Header       IOTC Frame Header (cmd=0x0601)
+[16-35] 20    UID          Device UID (null-padded ASCII)
+[36-51] 16    Reserved     Zero-filled
+[52-59] 8     RandomID     8 random bytes for session
+[60]    1     Stage        1=broadcast, 2=direct
+[61-71] 11    Reserved     Zero-filled
+[72-79] 8     AuthKey      Calculated auth key
+```
+
+### 4.3 Session Request (0x0402) - 52 bytes total
+
+```
+Offset  Size  Field        Description
+──────────────────────────────────────────────────────────────
+[0-15]  16    Header       IOTC Frame Header (cmd=0x0402)
+[16-35] 20    UID          Device UID (null-padded ASCII)
+[36-43] 8     RandomID     Same as Disco
+[44-47] 4     Reserved     Zero-filled
+[48-51] 4     Timestamp    Unix timestamp (LE)
+```
+
+### 4.4 Data TX (0x0407) - Variable
+
+Wraps DTLS records for transmission:
+
+```
+Offset  Size  Field        Description
+──────────────────────────────────────────────────────────────
+[0-15]  16    Header       IOTC Frame Header (cmd=0x0407)
+[16-17] 2     RandomID[0:2]
+[18]    1     Channel      0=Main (DTLS client), 1=Back (DTLS server)
+[19]    1     Marker       Always 0x01
+[20-23] 4     Const        Always 0x0000000C
+[24-31] 8     RandomID     Full 8-byte random ID
+[32+]   var   Payload      DTLS record data
+```
+
+---
+
+## 5. DTLS Transport
+
+DTLS records are wrapped in IOTC DATA_TX (0x0407) packets for transmission and extracted from DATA_RX (0x0408) packets on reception.
+
+### PSK Callback
+
+```
+Identity: "AUTHPWD_admin"
+PSK: SHA256(ENR_string) → 32 bytes
+```
+
+### Nonce Construction
+
+```
+nonce[12] = IV[12] XOR (epoch[2] || sequenceNumber[6] || padding[4])
+```
+
+### AEAD Additional Data
+
+```
+additional_data = epoch[2] || sequenceNumber[6] || contentType[1] || version[2] || payloadLength[2]
+```
 
 ---
 
 ## 6. AV Login
 
-After DTLS handshake, send AV login packets.
+After DTLS handshake, two login packets establish the AV session.
 
 ### AV Login Packet #1 (570 bytes)
 
 ```
-Offset   Size  Field           Value
-------   ----  -----           -----
-0-1      2     Magic           0x0000
-2-3      2     Version         0x000c (12)
-16-17    2     PayloadSize     0x0222 (546)
-18-19    2     Flags           0x0001
-20-23    4     RandomID        Random bytes
-24-279   256   Username        "admin" (null-padded)
-280-535  256   Password        ENR
-546-549  4     Resend          0x00000001
-550-553  4     SecurityMode    0x00000004 (DTLS)
-554-557  4     Capabilities    0x001f07fb
+Offset    Size  Field          Value/Description
+──────────────────────────────────────────────────────────────
+[0-1]     2     Magic          0x0000 (LE)
+[2-3]     2     Version        0x000C (12)
+[4-15]    12    Reserved       Zero-filled
+[16-17]   2     PayloadSize    0x0222 (546)
+[18-19]   2     Flags          0x0001
+[20-23]   4     RandomID       4 random bytes
+[24-279]  256   Username       "admin" (null-padded)
+[280-535] 256   Password       ENR string (null-padded)
+[536-539] 4     Resend         0x00000000
+[540-543] 4     SecurityMode   0x00000002 (AV_SECURITY_AUTO)
+[544-547] 4     AuthType       0x00000000 (PASSWORD)
+[548-551] 4     SyncRecvData   0x00000000
+[552-555] 4     Capabilities   0x001F07FB
+[556-569] 14    Reserved       Zero-filled
 ```
 
 ### AV Login Packet #2 (572 bytes)
 
-Same structure but:
+Same structure as #1 with:
 - Magic = 0x2000
-- Flags = 0x0000
 - PayloadSize = 0x0224 (548)
+- Flags = 0x0000
+- RandomID[0] incremented by 1
 
 ### AV Login Response (0x2100)
 
-Camera responds with magic 0x2100 confirming login.
+```
+Offset  Size  Field            Description
+──────────────────────────────────────────────────────────────
+[0-1]   2     Magic            0x2100
+[2-3]   2     Version          0x000C
+[4]     1     ResponseType     0x10 = success
+[5-15]  11    Reserved
+[16-19] 4     PayloadSize      0x00000024 (36)
+[20-23] 4     Checksum         Echo from request
+[24-27] 4     Reserved
+[28]    1     Flag1
+[29]    1     EnableFlag       0x01 if enabled
+[30]    1     Flag2
+[31]    1     TwoWayAudio      0x01 if intercom supported
+[32-35] 4     Reserved
+[36-39] 4     BufferConfig     0x00000004
+[40-43] 4     Capabilities     0x001F07FB (see below)
+[44-57] 14    Reserved
+```
+
+### Capabilities Bitmask (0x001F07FB)
+
+```
+Bit   Hex        Name                    Description
+──────────────────────────────────────────────────────────────
+0     0x00000001 CYCLIC_FRAME_NUMBERING  Frame numbers wrap around
+1     0x00000002 CLEAN_BUF_ON_RESET      Clear buffer on stream reset
+3     0x00000008 TIMESTAMP_IN_FRAMEINFO  Timestamps in FRAMEINFO struct
+4     0x00000010 MULTI_CHANNEL           Multiple AV channels supported
+5     0x00000020 EXTENDED_FRAMEINFO      40-byte FRAMEINFO (vs 16-byte SDK)
+6     0x00000040 RESEND_TIMEOUT          Packet resend with timeout
+7     0x00000080 DTLS_SUPPORT            DTLS encryption supported
+8     0x00000100 SPEAKER_CHANNEL         Two-way audio / intercom
+9     0x00000200 PTZ_CHANNEL             PTZ control channel
+10    0x00000400 PLAYBACK_CHANNEL        SD card playback channel
+16    0x00010000 AV_SECURITY_ENABLED     Encrypted AV stream
+17    0x00020000 RESEND_ENABLED          Packet resend mechanism
+18    0x00040000 DTLS_PSK                DTLS with Pre-Shared Key
+19    0x00080000 DTLS_ECDHE              DTLS with ECDHE key exchange
+20    0x00100000 CHACHA20_POLY1305       ChaCha20-Poly1305 cipher support
+```
+
+**0x001F07FB breakdown:**
+```
+0x001F07FB = 0b0000_0000_0001_1111_0000_0111_1111_1011
+           = Bits: 0,1,3,4,5,6,7,8,9,10,16,17,18,19,20
+```
 
 ---
 
 ## 7. K-Command Authentication
 
-### K-Command Flow
+K-Commands use the "HL" header format and are sent inside IOCTRL frames.
+
+### IOCTRL Frame Wrapper (40+ bytes)
 
 ```
-K10000 → Client sends auth request
-K10001 ← Camera sends 16-byte challenge + status byte
-ACK    → Client acknowledges
-K10002 → Client sends XXTEA-encrypted response
-K10003 ← Camera sends auth result (JSON with camera info)
-ACK    → Client acknowledges
-         ↓
-      Streaming begins automatically!
+Offset  Size  Field          Description
+──────────────────────────────────────────────────────────────
+[0-1]   2     Magic          0x000C
+[2-3]   2     Version        0x000C
+[4-7]   4     AVSeq          AV sequence number (LE)
+[8-15]  8     Reserved       Zero-filled
+[16-17] 2     IOCTRLMagic    0x7000
+[18-19] 2     SubChannel     Command sequence (increments)
+[20-23] 4     IOCTRLSeq      Always 0x00000001
+[24-27] 4     PayloadSize    HL payload size + 4
+[28-31] 4     Flag           Matches SubChannel
+[32-35] 4     Reserved
+[36-37] 2     IOType         0x0100
+[38-39] 2     Reserved
+[40+]   var   HLPayload      K-Command data
 ```
 
-### K10000 Structure (16 bytes)
+### HL Header (16 bytes)
 
 ```
-Offset  Size  Field           Value
-------  ----  -----           -----
-0-1     2     Magic           "HL"
-2       1     Version         5
-4-5     2     CmdID           10000 (0x2710)
+Offset  Size  Field          Description
+──────────────────────────────────────────────────────────────
+[0-1]   2     Magic          "HL" (0x48 0x4C)
+[2]     1     Version        5
+[3]     1     Reserved       0x00
+[4-5]   2     CommandID      10000, 10001, 10002, etc. (LE)
+[6-7]   2     PayloadLen     Payload length after header (LE)
+[8-15]  8     Reserved       Zero-filled
+[16+]   var   Payload        Command-specific data
 ```
 
-### K10001 Structure (33+ bytes)
+### K10000 - Auth Request (16 bytes)
+
+Header only, no payload. Initiates authentication.
+
+### K10001 - Challenge (33+ bytes)
 
 ```
-Offset  Size  Field           Description
-------  ----  -----           -----------
-0-1     2     Magic           "HL"
-4-5     2     CmdID           10001 (0x2711)
-16      1     Status          1, 3, or 6 (key selection)
-17-32   16    Challenge       Random bytes to decrypt
+Offset  Size  Field          Description
+──────────────────────────────────────────────────────────────
+[0-15]  16    HLHeader       CommandID = 10001
+[16]    1     Status         Key selection: 1, 3, or 6
+[17-32] 16    Challenge      XXTEA-encrypted challenge bytes
 ```
 
-### Status Byte Interpretation
+**Status Interpretation:**
+| Status | Key Source |
+|--------|------------|
+| 1 | Default key: 16 x 0xFF |
+| 3 | ENR[0:16] |
+| 6 | Double decrypt: first ENR[0:16], then ENR[16:32] |
 
-| Status | Key Derivation |
-|--------|----------------|
-| 1 | Use "FFFFFFFFFFFFFFFF" (default) |
-| 3 | Use ENR[0:16] |
-| 6 | Double decryption: ENR[0:16] then ENR[16:32] |
-
-### K10002 Structure (38 bytes)
+### K10002 - Challenge Response (38 bytes)
 
 ```
-Offset  Size  Field           Value
-------  ----  -----           -----
-0-1     2     Magic           "HL"
-2       1     Version         5
-4-5     2     CmdID           10002 (0x2712)
-6       1     PayloadLen      22
-16-31   16    Response        XXTEA-decrypted challenge
-32-35   4     UIDPrefix       First 4 bytes of UID
-36      1     VideoFlag       1 = enable video
-37      1     AudioFlag       1 = enable audio
+Offset  Size  Field          Description
+──────────────────────────────────────────────────────────────
+[0-15]  16    HLHeader       CommandID = 10002, PayloadLen = 22
+[16-31] 16    Response       XXTEA-decrypted challenge
+[32-35] 4     UIDPrefix      First 4 bytes of UID
+[36]    1     VideoFlag      1 = enable video stream
+[37]    1     AudioFlag      1 = enable audio stream
 ```
 
-### K10003 Response
+### K10003 - Auth Result
 
-Contains JSON with camera capabilities:
+Variable length, contains JSON payload:
 
 ```json
 {
-    "connectionRes": "1",
-    "cameraInfo": {
-        "apartalarmParm": {
-            "heightY": "50",
-            "longX": "50",
-            "startX": "25",
-            "startY": "25",
-            "type": "0"
-        },
-        "basicInfo": {
-            "firmware": "4.52.9.4188",
-            "hardware": "0.0.0.0",
-            "mac": "123456789ABC",
-            "model": "HL_CAM4",
-            "type": "camera",
-            "wifidb": "70"
-        },
-        "channelResquestResult": {
-            "audio": "1",
-            "video": "1"
-        },
-        "recordType": {
-            "type": "1"
-        },
-        "sdParm": {
-            "capacity": "0",
-            "detail": "0",
-            "free": "0",
-            "status": "2"
-        },
-        "settingParm": {
-            "logSd": "1",
-            "logUdisk": "1",
-            "nightVision": "3",
-            "osd": "1",
-            "stateVision": "1",
-            "telnet": "2",
-            "tz": "1"
-        },
-        "uDiskParm": {
-            "capacity": "0",
-            "free": "0",
-            "status": "2"
-        },
-        "videoParm": {
-            "bitRate": "30",
-            "fps": "20",
-            "horizontalFlip": "1",
-            "logo": "1",
-            "resolution": "2",
-            "time": "1",
-            "type": "H264",
-            "verticalFlip": "1"
-        }
+  "connectionRes": "1",
+  "cameraInfo": {
+    "basicInfo": {
+      "firmware": "4.52.9.4188",
+      "mac": "AABBCCDDEEFF",
+      "model": "HL_CAM4"
+    },
+    "channelResquestResult": {
+      "audio": "1",
+      "video": "1"
     }
+  }
 }
 ```
+
+After K10003, video/audio streaming begins automatically.
 
 ---
 
-## 8. AV Streaming Protocol
+## 8. K-Command Control
 
-After K-Auth, the camera sends AV data packets with channel-based routing.
+### K10010 - Control Channel (18 bytes)
 
-### Channels
+Start or stop media streams:
 
-| Channel | Type | Description |
-|---------|------|-------------|
-| 0x03 | Audio | Single-packet frames (always pkt_total=1) |
+```
+Offset  Size  Field          Description
+──────────────────────────────────────────────────────────────
+[0-15]  16    HLHeader       CommandID = 10010, PayloadLen = 2
+[16]    1     MediaType      1=Video, 2=Audio, 3=ReturnAudio
+[17]    1     Enable         1=Enable, 2=Disable
+```
+
+**Media Types:**
+| Value | Type | Description |
+|-------|------|-------------|
+| 1 | Video | Main video stream |
+| 2 | Audio | Audio from camera |
+| 3 | ReturnAudio | Intercom (audio to camera) |
+| 4 | RDT | Raw data transfer |
+
+### K10056 - Set Resolution (21 bytes)
+
+```
+Offset  Size  Field          Description
+──────────────────────────────────────────────────────────────
+[0-15]  16    HLHeader       CommandID = 10056, PayloadLen = 5
+[16]    1     FrameSize      Resolution + 1 (see table)
+[17-18] 2     Bitrate        KB/s value (LE)
+[19-20] 2     FPS            Frames per second, 0 = auto
+```
+
+**Frame Sizes:**
+| Value | Resolution |
+|-------|------------|
+| 1 | 1080P (1920x1080) |
+| 2 | 360P (640x360) |
+| 3 | 720P (1280x720) |
+| 4 | 2K (2560x1440) |
+
+**Bitrate Values:**
+| Value | Rate |
+|-------|------|
+| 0xF0 (240) | Maximum |
+| 0x3C (60) | SD quality |
+
+---
+
+## 9. AV Frame Structure
+
+### 9.1 Channels
+
+| Value | Name | Description |
+|-------|------|-------------|
+| 0x03 | Audio | Audio frames (always single-packet) |
 | 0x05 | I-Video | Keyframes (can be multi-packet) |
-| 0x07 | P-Video | Delta frames (can be multi-packet) |
+| 0x07 | P-Video | Predictive frames (can be multi-packet) |
 
-### Frame Types (Complete)
+### 9.2 Frame Types
 
-| Type | Name | Header | FrameInfo | Description |
-|------|------|--------|-----------|-------------|
-| 0x00 | Cont | 28 | No | Continuation (middle packet) |
-| 0x01 | EndSingle | 28 | 40 bytes | Single-packet frame |
-| 0x04 | ContAlt | 28 | No | Alternative continuation |
-| 0x05 | EndMulti | 28 | 40 bytes | Last packet of multi-packet frame |
-| 0x08 | Start | 36 | No | First packet of multi-packet I-frame |
-| 0x09 | StartAlt | 36 | 40 bytes* | Single-packet OR multi-packet start |
-| 0x0d | EndExt | 36 | 40 bytes | Extended end (commonly used for Audio) |
+| Type | Name | Header Size | Has FRAMEINFO |
+|------|------|-------------|---------------|
+| 0x00 | Cont | 28 bytes | No |
+| 0x01 | EndSingle | 28 bytes | Yes (40B) |
+| 0x04 | ContAlt | 28 bytes | No |
+| 0x05 | EndMulti | 28 bytes | Yes (40B) |
+| 0x08 | Start | 36 bytes | No |
+| 0x09 | StartAlt | 36 bytes | Yes if pkt_total=1 |
+| 0x0D | EndExt | 36 bytes | Yes (40B) |
 
-*0x09 has FrameInfo only when pkt_total == 1 (single-packet frame)
+### 9.3 28-Byte Header Layout
 
-### Header Size Detection
-
-**IMPORTANT**: Header size is determined by FrameType
-
-```go
-switch frameType {
-case 0x08, 0x09, 0x0d:  // Start, StartAlt, EndExt
-    headerSize = 36
-default:                // Cont, ContAlt, EndSingle, EndMulti
-    headerSize = 28
-}
-```
-
-### 28-Byte Header Layout
-
-Used by: Cont (0x00), ContAlt (0x04), EndSingle (0x01), EndMulti (0x05)
+Used by: Cont (0x00), EndSingle (0x01), ContAlt (0x04), EndMulti (0x05)
 
 ```
-Offset  Size  Field                   Description
-──────────────────────────────────────────────────────────────────────────
-[0]     1     Channel                 0x03=Audio, 0x05=I-Video, 0x07=P-Video
-[1]     1     FrameType               0x00/0x01/0x04/0x05
-[2-3]   2     Version                 Always 0x000b (11)
-[4-5]   2     TX Sequence             Global incrementing (uint16 LE)
-[6-7]   2     Magic                   Always 0x507e (LE) - "P~"
-[8]     1     Channel                 Duplicate of [0]
-[9]     1     Stream Index            0x00 normal, 0x01 for End packets
-[10-11] 2     Running Packet Counter  Global counter (does NOT reset per frame)
-[12-13] 2     pkt_total               Total packets in this frame
-[14-15] 2     pkt_idx OR 0x0028       See "FrameInfo Marker" below
-[16-17] 2     Payload Size            Usually 0x0400 (1024) for video
-[18-19] 2     Reserved                Always 0x0000
-[20-23] 4     Previous Frame          Previous frame number (or 0)
-[24-27] 4     Frame Number            Current frame number (uint32 LE) → USE FOR REASSEMBLY
+Offset  Size  Field              Description
+──────────────────────────────────────────────────────────────
+[0]     1     Channel            0x03/0x05/0x07
+[1]     1     FrameType          0x00/0x01/0x04/0x05
+[2-3]   2     Version            0x000B (11)
+[4-5]   2     TxSequence         Global incrementing sequence (LE)
+[6-7]   2     Magic              0x507E ("P~")
+[8]     1     Channel            Duplicate of [0]
+[9]     1     StreamIndex        0x00 normal, 0x01 for End packets
+[10-11] 2     PacketCounter      Running counter (does NOT reset per frame)
+[12-13] 2     pkt_total          Total packets in this frame (LE)
+[14-15] 2     pkt_idx/Marker     Packet index OR 0x0028 = FRAMEINFO present
+[16-17] 2     PayloadSize        Payload bytes (LE)
+[18-19] 2     Reserved           0x0000
+[20-23] 4     PrevFrameNo        Previous frame number (LE)
+[24-27] 4     FrameNo            Current frame number (LE) → USE FOR REASSEMBLY
 ```
 
-### 36-Byte Header Layout
+### 9.4 36-Byte Header Layout
 
-Used by: Start (0x08), StartAlt (0x09), EndExt (0x0d)
+Used by: Start (0x08), StartAlt (0x09), EndExt (0x0D)
 
 ```
-Offset  Size  Field                   Description
-──────────────────────────────────────────────────────────────────────────
-[0]     1     Channel                 0x03=Audio, 0x05=I-Video, 0x07=P-Video
-[1]     1     FrameType               0x08/0x09/0x0d
-[2-3]   2     Version                 Always 0x000b (11)
-[4-5]   2     TX Sequence             Global incrementing (uint16 LE)
-[6-7]   2     Magic                   Always 0x507e (LE) - "P~"
-[8-11]  4     Timestamp/ID            Variable - NOT reliable!
-[12-15] 4     Variable                NOT reliable for header detection!
-[16]    1     Channel                 Duplicate of [0]
-[17]    1     Stream Index            0x00 normal, 0x01 for End/Audio
-[18-19] 2     Channel Frame Index     Per-channel index - NOT for reassembly!
-[20-21] 2     pkt_total               Total packets in this frame
-[22-23] 2     pkt_idx OR 0x0028       See "FrameInfo Marker" below
-[24-25] 2     Payload Size            Usually 0x0400 (1024) for video
-[26-27] 2     Reserved                Always 0x0000
-[28-31] 4     Previous Frame          Previous global frame number
-[32-35] 4     Frame Number            Current global frame (uint32 LE) → USE FOR REASSEMBLY
+Offset  Size  Field              Description
+──────────────────────────────────────────────────────────────
+[0]     1     Channel            0x03/0x05/0x07
+[1]     1     FrameType          0x08/0x09/0x0D
+[2-3]   2     Version            0x000B (11)
+[4-5]   2     TxSequence         Global incrementing sequence (LE)
+[6-7]   2     Magic              0x507E ("P~")
+[8-11]  4     TimestampOrID      Variable (not reliable)
+[12-15] 4     Flags              Variable
+[16]    1     Channel            Duplicate of [0]
+[17]    1     StreamIndex        0x00 normal, 0x01 for End/Audio
+[18-19] 2     ChannelFrameIdx    Per-channel index (NOT for reassembly)
+[20-21] 2     pkt_total          Total packets in this frame (LE)
+[22-23] 2     pkt_idx/Marker     Packet index OR 0x0028 = FRAMEINFO present
+[24-25] 2     PayloadSize        Payload bytes (LE)
+[26-27] 2     Reserved           0x0000
+[28-31] 4     PrevFrameNo        Previous frame number (LE)
+[32-35] 4     FrameNo            Current frame number (LE) → USE FOR REASSEMBLY
 ```
 
-**CRITICAL**: [18-19] is channel-specific index (starts at 0 per channel).
-For frame reassembly, use [32-35] which matches the [24-27] position in 28-byte headers.
+### 9.5 FRAMEINFO Marker (0x0028)
 
-### FrameInfo Marker (0x0028)
-
-The value at [14-15] (28-byte) or [22-23] (36-byte) has dual meaning:
+The value at offset [14-15] (28-byte) or [22-23] (36-byte) has dual meaning:
 
 | Condition | Interpretation |
 |-----------|----------------|
-| End packet (0x01, 0x05, 0x0d) AND value == 0x0028 | FrameInfo marker - 40 bytes at payload end |
-| Otherwise | pkt_idx (0-based packet index within frame) |
+| End packet AND value == 0x0028 | FRAMEINFO present (40 bytes at payload end) |
+| Otherwise | Actual packet index within frame |
 
-**IMPORTANT**: 0x0028 (hex) = 40 (decimal). For non-End packets, this is simply pkt_idx=40!
-
-```go
-if IsEndFrame(frameType) && pktIdxOrMarker == 0x0028 {
-    hasFrameInfo = true
-    pktIdx = pktTotal - 1  // Last packet
-} else {
-    pktIdx = pktIdxOrMarker  // Actual packet index
-}
-```
-
-### Frame Reassembly Algorithm
-
-```
-1. Parse PacketHeader to get: channel, frameType, pkt_idx, pkt_total, frame_no
-
-2. On frame number change:
-   - Emit previous frame if complete (all packets + FrameInfo)
-   - Otherwise log as incomplete
-
-3. Store packet:
-   - Key: pkt_idx
-   - Value: payload (MUST be copied - buffer is reused!)
-
-4. Store FrameInfo if present (End packets)
-
-5. When all packets received AND FrameInfo present:
-   - Assemble in order: packets[0] + packets[1] + ... + packets[pkt_total-1]
-   - Validate size against FrameInfo.PayloadSize
-   - Emit complete frame
-```
-
-### Example: Multi-Packet I-Frame (14 packets)
-
-```
-[WIRE] ch=0x05 type=0x08 pkt=0/14 frame=1    ← Start (36-byte header)
-[WIRE] ch=0x05 type=0x00 pkt=1/14 frame=1    ← Cont (28-byte header)
-[WIRE] ch=0x05 type=0x00 pkt=2/14 frame=1    ← Cont
-...
-[WIRE] ch=0x05 type=0x00 pkt=12/14 frame=1   ← Cont
-[WIRE] ch=0x05 type=0x05 pkt=13/14 frame=1   ← EndMulti + FrameInfo (28-byte header)
-```
-
-### Example: Single-Packet P-Frame
-
-```
-[WIRE] ch=0x07 type=0x05 pkt=0/1 frame=42    ← EndSingle + FrameInfo
-```
-
-### Audio Specifics
-
-- Always single-packet frames (pkt_total=1)
-- Commonly uses EndExt (0x0d) with 36-byte header
-- Payload size at [24-27] is uint32 (not uint16 like video)
+**Note:** 0x0028 hex = 40 decimal. For non-End packets, this could be pkt_idx=40.
 
 ---
 
-## 9. FRAMEINFO Structure
+## 10. FRAMEINFO Structure
 
-### Location
+### 10.1 RX FRAMEINFO (40 bytes) - From Camera
 
-FrameInfo is appended to the **end** of End packets (types 0x01, 0x05, 0x0d, and 0x09 when pkt_total=1).
-
-```
-[Header: 28 or 36 bytes][Payload: variable][FrameInfo: 40 bytes]
-```
-
-The FrameInfo marker (0x0028 at [14-15] or [22-23]) indicates its presence.
-
-### Wire Format (40 bytes - Wyze Extension)
+Appended to the end of End packets (0x01, 0x05, 0x0D, or 0x09 when pkt_total=1):
 
 ```
-Offset  Size  Field           Description
-──────────────────────────────────────────────────────────────────────────
-[0-1]   2     codec_id        Video: 0x004e (H.264), 0x0050 (H.265)
-                              Audio: 0x0090 (AAC-ELD), 0x0089 (G.711u), etc.
-[2]     1     flags           Video: 0x00=P-frame, 0x01=I-frame (keyframe)
-                              Audio: (sr_idx<<2) | (bits16<<1) | channels
-[3]     1     cam_index       Camera index (usually 0)
-[4]     1     online_num      Online viewer count
-[5]     1     tags            Bit flags (commonly 0x14 for video)
-[6-7]   2     reserved        Always 0x0000
-[8-11]  4     timestamp_us    Microseconds within second (0-999999)
-[12-15] 4     timestamp_sec   Unix timestamp in SECONDS
-[16-19] 4     payload_size    Total payload size (for validation)
-[20-23] 4     frame_no        Absolute frame counter (since camera boot)
-[24-39] 16    device_id       MAC address as ASCII (e.g., "80482C4CF472")
+Offset  Size  Field          Description
+──────────────────────────────────────────────────────────────
+[0-1]   2     codec_id       Video: 0x4E (H.264), 0x50 (H.265)
+                             Audio: 0x90 (AAC), 0x89 (G.711μ), etc.
+[2]     1     flags          Video: 0x00=P-frame, 0x01=I-frame (keyframe)
+                             Audio: (sr_idx << 2) | (bits16 << 1) | stereo
+[3]     1     cam_index      Camera index (usually 0)
+[4]     1     online_num     Number of viewers
+[5]     1     framerate      FPS (e.g., 20, 30)
+[6]     1     frame_size     0=1080P, 1=SD, 2=360P, 4=2K
+[7]     1     bitrate        Bitrate value
+[8-11]  4     timestamp_us   Microseconds within second (0-999999)
+[12-15] 4     timestamp      Unix timestamp in seconds (LE)
+[16-19] 4     payload_size   Total payload size for validation (LE)
+[20-23] 4     frame_no       Absolute frame counter (LE)
+[24-39] 16    device_id      MAC address as ASCII + padding
 ```
 
-**SDK vs Wire Format**: The official SDK FRAMEINFO_t is only 16 bytes. Wyze extends it to 40 bytes with additional fields.
+### 10.2 TX FRAMEINFO (16 bytes) - To Camera
 
-### Frame Number Note
-
-The `frame_no` in FrameInfo is the **absolute** counter since camera boot (e.g., 1610082).
-This differs from the header's `Frame Number` field which is relative to the session.
-
-### Audio Flags Encoding
+Used for audio backchannel (intercom):
 
 ```
-flags = (sample_rate_index << 2) | (bits16 << 1) | channels
+Offset  Size  Field          Description
+──────────────────────────────────────────────────────────────
+[0-1]   2     codec_id       0x0090 (AAC Wyze), 0x0089 (G.711μ), etc.
+[2]     1     flags          (sr_idx << 2) | (bits16 << 1) | stereo
+[3]     1     cam_index      0
+[4]     1     online_num     1 (for TX)
+[5]     1     tags           0
+[6-11]  6     reserved       Zero-filled
+[12-15] 4     timestamp_ms   Cumulative: (frame_no - 1) * frame_duration_ms
+```
+
+### 10.3 Audio Flags Encoding
+
+```
+flags = (sample_rate_index << 2) | (bits16 << 1) | stereo
 
 Example: 16kHz, 16-bit, Mono
-(3 << 2) | (1 << 1) | 0 = 0x0E
-```
-
-### Parsing Implementation
-
-```go
-func ParseFrameInfo(data []byte) *FrameInfo {
-    offset := len(data) - 40  // FRAMEINFO at END of packet
-    fi := data[offset:]
-
-    return &FrameInfo{
-        CodecID:     binary.LittleEndian.Uint16(fi[0:2]),
-        Flags:       fi[2],
-        CamIndex:    fi[3],
-        OnlineNum:   fi[4],
-        Tags:        fi[5],
-        TimestampUS: binary.LittleEndian.Uint32(fi[8:12]),
-        Timestamp:   binary.LittleEndian.Uint32(fi[12:16]),
-        PayloadSize: binary.LittleEndian.Uint32(fi[16:20]),
-        FrameNo:     binary.LittleEndian.Uint32(fi[20:24]),
-    }
-}
+  sr_idx=3, bits16=1, stereo=0
+  flags = (3 << 2) | (1 << 1) | 0 = 0x0E
 ```
 
 ---
 
-## 10. Codec IDs & Sample Rates
+## 11. Codec Reference
 
-### Video Codecs
+### 11.1 Video Codecs
 
-| Name | ID | Hex | Description |
-|------|-----|-----|-------------|
-| MPEG4 | 76 | 0x4C | MPEG-4 |
-| H.263 | 77 | 0x4D | H.263 |
-| H.264 | 78 | 0x4E | H.264/AVC |
-| MJPEG | 79 | 0x4F | Motion JPEG |
-| H.265 | 80 | 0x50 | H.265/HEVC |
+| ID (Hex) | ID (Dec) | Name |
+|----------|----------|------|
+| 0x4C | 76 | MPEG-4 |
+| 0x4D | 77 | H.263 |
+| 0x4E | 78 | H.264/AVC |
+| 0x4F | 79 | MJPEG |
+| 0x50 | 80 | H.265/HEVC |
 
-### Audio Codecs
+### 11.2 Audio Codecs
 
-| Name | ID | Hex | Description |
-|------|-----|-----|-------------|
-| AAC Raw | 134 | 0x86 | AAC raw |
-| AAC ADTS | 135 | 0x87 | AAC with ADTS header |
-| AAC LATM | 136 | 0x88 | AAC with LATM |
-| G.711 u-law | 137 | 0x89 | PCMU |
-| G.711 A-law | 138 | 0x8A | PCMA |
-| ADPCM | 139 | 0x8B | ADPCM |
-| PCM | 140 | 0x8C | PCM 16-bit |
-| Speex | 141 | 0x8D | Speex |
-| MP3 | 142 | 0x8E | MP3 |
-| G.726 | 143 | 0x8F | G.726 |
-| AAC-ELD | 144 | 0x90 | AAC Enhanced Low Delay |
-| Opus | 146 | 0x92 | Opus |
+| ID (Hex) | ID (Dec) | Name |
+|----------|----------|------|
+| 0x86 | 134 | AAC Raw |
+| 0x87 | 135 | AAC ADTS |
+| 0x88 | 136 | AAC LATM |
+| 0x89 | 137 | G.711 μ-law (PCMU) |
+| 0x8A | 138 | G.711 A-law (PCMA) |
+| 0x8B | 139 | ADPCM |
+| 0x8C | 140 | PCM 16-bit LE |
+| 0x8D | 141 | Speex |
+| 0x8E | 142 | MP3 |
+| 0x8F | 143 | G.726 |
+| 0x90 | 144 | AAC Wyze |
+| 0x92 | 146 | Opus |
 
-### Sample Rates
+### 11.3 Sample Rate Index
 
 | Index | Frequency |
 |-------|-----------|
@@ -705,321 +677,293 @@ func ParseFrameInfo(data []byte) *FrameInfo {
 
 ---
 
-## 11. RTP Timestamp Calculation
+## 12. Two-Way Audio (Backchannel)
 
-### Combining Timestamp Fields
+### 12.1 Activation Flow
 
-FRAMEINFO contains split timestamps that must be combined:
+1. Send K10010 with MediaType=3 (ReturnAudio), Enable=1
+2. Wait for K10011 response confirming activation
+3. Camera initiates DTLS connection back (we become DTLS **server**)
+4. Use Channel 1 (IOTCChannelBack) for audio transmission
 
-```go
-// Combine for absolute timestamp in microseconds
-absoluteTS := uint64(fi.Timestamp) * 1000000 + uint64(fi.TimestampUS)
+### 12.2 Audio TX Frame Format
 
-// Convert to RTP timestamp (90kHz for video)
-rtpTS := uint32(absoluteTS * 90000 / 1000000)
-
-// For audio, use codec-specific clock rate
-clockRate := fi.SampleRate()  // e.g., 16000 for 16kHz
-rtpTS := uint32(absoluteTS * clockRate / 1000000)
-```
-
-### Example
+All audio TX uses 0x09 single-packet frames with 36-byte header:
 
 ```
-timestamp_sec=1766928018, timestamp_us=980266
-  → absolute = 1766928018980266 µs
-  → rtp_video = (absolute * 90000 / 1000000) = wrapped to uint32
-
-At 20fps: delta between frames ≈ 50000 µs (50ms)
+Offset  Size  Field              Description
+──────────────────────────────────────────────────────────────
+[0]     1     Channel            0x03 (Audio)
+[1]     1     FrameType          0x09 (StartAlt/Single)
+[2-3]   2     Version            0x000C (12)
+[4-7]   4     TxSeq              Audio TX sequence number (LE)
+[8-11]  4     TimestampUS        Timestamp in microseconds (LE)
+[12-15] 4     Flags              0x00000001 (first), 0x00100001 (subsequent)
+[16]    1     Channel            0x03
+[17]    1     FrameType          0x01 (EndSingle)
+[18-19] 2     PrevFrameNo        prev_frame_no (16-bit, LE)
+[20-21] 2     pkt_total          0x0001 (always single packet)
+[22-23] 2     Flags              0x0010
+[24-27] 4     PayloadSize        audio_len + 16 (includes FRAMEINFO)
+[28-31] 4     PrevFrameNo        prev_frame_no (32-bit, LE)
+[32-35] 4     FrameNo            Current frame number (LE)
+[36...]       AudioPayload       AAC/G.711/Opus data
+[end-16] 16   FRAMEINFO          TX FRAMEINFO (16 bytes)
 ```
 
 ---
 
-## 12. Intercom
+## 13. Frame Reassembly
 
-### Two-Way Audio (K10010)
+### Algorithm
 
-Wyze cameras support intercom via the K10010 ControlChannel command.
+```
+1. Parse packet header to extract:
+   - channel, frameType, pkt_idx, pkt_total, frame_no
 
-```go
-// K10010 structure
-buf := make([]byte, 21)
-buf[0], buf[1] = 'H', 'L'
-buf[2] = 5  // Version
-binary.LittleEndian.PutUint16(buf[4:6], 10010)
-buf[6] = 5  // Payload length
-buf[16] = mediaType  // 1=Video, 2=Audio, 3=ReturnAudio
-buf[17] = enabled    // 1=Enable, 2=Disable
+2. Detect frame transition:
+   - If frame_no changed from previous packet:
+     - Emit previous frame if complete
+     - Log incomplete frames
+
+3. Store packet data:
+   - Key: pkt_idx (0 to pkt_total-1)
+   - Value: payload bytes (COPY - buffer is reused!)
+
+4. Store FRAMEINFO if present:
+   - Only in End packets (0x01, 0x05, 0x0D)
+   - Or 0x09 when pkt_total == 1
+
+5. Check completion:
+   - All pkt_total packets received?
+   - FRAMEINFO present?
+
+6. Assemble frame:
+   - Concatenate: packets[0] + packets[1] + ... + packets[pkt_total-1]
+   - Validate size against FRAMEINFO.payload_size
+   - Emit to consumer
 ```
 
-### Media Types
+### Example: Multi-Packet I-Frame (14 packets)
 
-| Value | Type |
-|-------|------|
-| 1 | Video stream |
-| 2 | Audio stream (from camera) |
-| 3 | Return audio (to camera, intercom) |
-| 4 | RDT channel |
+```
+Packet 1:  ch=0x05 type=0x08 pkt=0/14 frame=1   ← Start (36B header)
+Packet 2:  ch=0x05 type=0x00 pkt=1/14 frame=1   ← Cont (28B header)
+Packet 3:  ch=0x05 type=0x00 pkt=2/14 frame=1   ← Cont
+...
+Packet 13: ch=0x05 type=0x00 pkt=12/14 frame=1  ← Cont
+Packet 14: ch=0x05 type=0x05 pkt=13/14 frame=1  ← EndMulti + FRAMEINFO
+```
 
-### Audio Format
+### Example: Single-Packet P-Frame
 
-- Detected from incoming audio FRAMEINFO
-- Default: AAC 16kHz Mono (codec=0x90, flags=0x0E)
-
-**Note**: SPEAKERSTART/SPEAKERSTOP IOCTRLs are NOT required. Only K10010 is needed.
-
----
-
-## 13. Error Codes
-
-### AV Error Codes
-
-| Code | Constant | Description |
-|------|----------|-------------|
-| 0 | AV_ER_NoERROR | Success |
-| -20000 | AV_ER_INVALID_ARG | Invalid argument |
-| -20006 | AV_ER_INVALID_SID | Invalid session ID |
-| -20011 | AV_ER_TIMEOUT | Operation timeout |
-| -20013 | AV_ER_INCOMPLETE_FRAME | Incomplete frame |
-| -20014 | AV_ER_LOSED_THIS_FRAME | Frame lost |
-| -20015 | AV_ER_SESSION_CLOSE_BY_REMOTE | Remote closed |
-| -20040 | AV_ER_DTLS_WRONG_PASSWORD | Wrong PSK |
-| -20041 | AV_ER_DTLS_AUTH_FAIL | DTLS auth failed |
-
-### IOTC Error Codes
-
-| Code | Constant | Description |
-|------|----------|-------------|
-| -1 | IOTC_ER_SERVER_NOT_RESPONSE | Server not responding |
-| -13 | IOTC_ER_TIMEOUT | Connection timeout |
-| -19 | IOTC_ER_CAN_NOT_FIND_DEVICE | Device not found |
-| -22 | IOTC_ER_SESSION_CLOSE_BY_REMOTE | Remote closed session |
-| -68 | IOTC_ER_DEVICE_REJECT_BY_WRONG_AUTH_KEY | Wrong auth key |
+```
+Packet 1:  ch=0x07 type=0x01 pkt=0/1 frame=42   ← EndSingle + FRAMEINFO
+```
 
 ---
 
-## 14. IOTYPE Constants
+## 14. Wyze Cloud API
 
-### Streaming Control
+### 14.1 Authentication
 
-| Constant | Value | Description |
-|----------|-------|-------------|
-| IOTYPE_USER_IPCAM_START | 0x01FF | Start video |
-| IOTYPE_USER_IPCAM_STOP | 0x02FF | Stop video |
-| IOTYPE_USER_IPCAM_AUDIOSTART | 0x0300 | Start audio |
-| IOTYPE_USER_IPCAM_AUDIOSTOP | 0x0301 | Stop audio |
+**Endpoint:** `POST https://auth-prod.api.wyze.com/api/user/login`
 
-### Intercom
+**Password Hashing:** Triple MD5
+```
+hash = password
+for i in range(3):
+    hash = MD5(hash).hex()
+```
 
-| Constant | Value | Description |
-|----------|-------|-------------|
-| IOTYPE_USER_IPCAM_SPEAKERSTART | 0x0350 | Start intercom |
-| IOTYPE_USER_IPCAM_SPEAKERSTOP | 0x0351 | Stop intercom |
+**Request Headers:**
+```
+Content-Type: application/json
+X-API-Key: WMXHYf79Nr5gIlt3r0r7p9Tcw5bvs6BB4U8O8nGJ
+Phone-Id: <random-uuid>
+User-Agent: wyze_ios_2.50.0
+```
 
-### Device Control
+**Request Body:**
+```json
+{
+  "email": "user@example.com",
+  "password": "<triple-md5-hash>"
+}
+```
 
-| Constant | Value | Description |
-|----------|-------|-------------|
-| IOTYPE_USER_IPCAM_PTZ_COMMAND | 0x1001 | PTZ control |
-| IOTYPE_USER_IPCAM_RECEIVE_FIRST_IFRAME | 0x1002 | Request keyframe |
-| IOTYPE_USER_IPCAM_DEVINFO_REQ | 0x0340 | Device info request |
+**Response:**
+```json
+{
+  "access_token": "...",
+  "refresh_token": "...",
+  "user_id": "..."
+}
+```
 
-### Wyze K-Commands
+### 14.2 Device List
 
-| CmdID | Name | Description |
-|-------|------|-------------|
-| 10000 | KCmdAuth | Auth request |
-| 10001 | KCmdChallenge | Challenge from camera |
-| 10002 | KCmdChallengeResp | Challenge response |
-| 10003 | KCmdAuthResult | Auth result |
-| 10010 | KCmdControlChannel | Start/stop media |
-| 10056 | KCmdSetResolution | Set resolution/bitrate |
-| 10057 | KCmdSetResolutionResp | Set resolution response |
+**Endpoint:** `POST https://api.wyzecam.com/app/v2/home_page/get_object_list`
 
----
+**Request Body:**
+```json
+{
+  "access_token": "<token>",
+  "phone_id": "<id>",
+  "app_name": "com.hualai.WyzeCam",
+  "app_ver": "com.hualai.WyzeCam___2.50.0",
+  "app_version": "2.50.0",
+  "phone_system_type": 1,
+  "sc": "9f275790cab94a72bd206c8876429f3c",
+  "sv": "9d74946e652647e9b6c9d59326aef104",
+  "ts": <unix_millis>
+}
+```
 
-## 15. Cryptography
-
-### XXTEA Algorithm
-
-Used for K-Auth challenge-response:
-
-```go
-const delta = 0x9e3779b9
-
-func XXTEADecrypt(data, key []byte) []byte {
-    // Convert to uint32 arrays
-    k := toUint32Array(key)  // 4 x uint32
-    v := toUint32Array(data) // n x uint32
-
-    n := len(v)
-    rounds := 6 + 52/n
-    sum := uint32(rounds) * delta
-
-    for rounds > 0 {
-        e := (sum >> 2) & 3
-        for p := n - 1; p > 0; p-- {
-            z := v[p-1]
-            v[p] -= mx(sum, y, z, p, e, k)
-            y = v[p]
-        }
-        // ... (full algorithm in crypto/xxtea.go)
-        sum -= delta
-        rounds--
+**Response (filtered for cameras):**
+```json
+{
+  "device_list": [
+    {
+      "mac": "AABBCCDDEEFF",
+      "p2p_id": "HSBJYB5HSETGCDWD111A",
+      "enr": "roTRg3tiuL3TjXhm...",
+      "ip": "192.168.1.100",
+      "nickname": "Front Door",
+      "product_model": "HL_CAM4",
+      "dtls": 1,
+      "firmware_ver": "4.52.9.4188"
     }
-    return toBytes(v)
-}
-```
-
-### TransCode ("Charlie") Cipher
-
-Obfuscates IOTC packets:
-
-```go
-const charlie = "Charlie is the designer of P2P!!"
-
-// XOR with charlie string + bit rotations + byte swapping
-func TransCodePartial(src []byte) []byte {
-    // Process in 16-byte blocks
-    // XOR with charlie
-    // Bit rotate uint32s
-    // Swap bytes
-}
-```
-
-### AuthKey Calculation
-
-```go
-func CalculateAuthKey(enr, mac string) []byte {
-    data := enr + strings.ToUpper(mac)
-    hash := sha256.Sum256([]byte(data))
-    b64 := base64.StdEncoding.EncodeToString(hash[:6])
-    // Replace +/= with Z/9/A
-    return []byte(b64)
+  ]
 }
 ```
 
 ---
 
-## 16. SDK Constants Reference
+## 15. Cryptography Details
 
-### Essential Constants (from TUTK SDK)
+### 15.1 XXTEA Algorithm
 
-```go
-// Video Codecs
-const (
-    CodecH264 uint16 = 0x4E  // H.264/AVC
-    CodecH265 uint16 = 0x50  // H.265/HEVC
-)
+Block cipher used for K-Auth challenge-response:
 
-// Audio Codecs
-const (
-    AudioCodecAACADTS uint16 = 0x87  // AAC with ADTS
-    AudioCodecAACELD  uint16 = 0x90  // AAC-ELD (Wyze)
-    AudioCodecG711U   uint16 = 0x89  // PCMU
-    AudioCodecOpus    uint16 = 0x92  // Opus
-)
+```
+Constants:
+  DELTA = 0x9E3779B9
 
-// IOTC Commands
-const (
-    CmdDiscoReq     uint16 = 0x0601
-    CmdDiscoRes     uint16 = 0x0602
-    CmdSessionReq   uint16 = 0x0402
-    CmdSessionRes   uint16 = 0x0404
-    CmdDataTX       uint16 = 0x0407
-    CmdDataRX       uint16 = 0x0408
-)
+Function mx(sum, y, z, p, e, k):
+  return (((z >> 5) ^ (y << 2)) + ((y >> 3) ^ (z << 4))) ^
+         ((sum ^ y) + (k[(p & 3) ^ e] ^ z))
 
-// K-Commands
-const (
-    KCmdAuth           = 10000
-    KCmdChallenge      = 10001
-    KCmdChallengeResp  = 10002
-    KCmdAuthResult     = 10003
-    KCmdControlChannel = 10010
-)
+Decrypt(data, key):
+  v = data as uint32[] (little-endian)
+  k = key as uint32[]
+  n = len(v)
+  rounds = 6 + 52/n
+  sum = rounds * DELTA
+
+  for round in range(rounds):
+    e = (sum >> 2) & 3
+    for p in range(n-1, 0, -1):
+      z = v[p-1]
+      v[p] -= mx(sum, y=v[(p+1) mod n], z, p, e, k)
+      y = v[p]
+    z = v[n-1]
+    v[0] -= mx(sum, y=v[1], z, 0, e, k)
+    y = v[0]
+    sum -= DELTA
+
+  return v as bytes
+```
+
+### 15.2 TransCode ("Charlie" Cipher)
+
+Obfuscation cipher for IOTC packets:
+
+```
+Magic string: "Charlie is the designer of P2P!!"
+
+Process in 16-byte blocks:
+  1. XOR each byte with corresponding position in magic string
+  2. Treat as 4 x uint32, rotate left by varying amounts
+  3. Apply byte permutation pattern
+
+Permutation for 16-byte block:
+  [11, 9, 8, 15, 13, 10, 12, 14, 2, 1, 5, 0, 6, 4, 7, 3]
+```
+
+### 15.3 AuthKey Calculation
+
+```
+input = ENR + uppercase(MAC)
+hash = SHA256(input)
+raw = hash[0:6]
+b64 = Base64Encode(raw)
+authkey = b64.replace('+', 'Z').replace('/', '9').replace('=', 'A')
 ```
 
 ---
 
-## 17. Low-Level Frame Formats
+## 16. Constants Reference
 
-### 0x0c IOCTL Frame (40-byte header)
+### 16.1 IOTC Commands
 
-All IOCTL commands (K10000, K10002) are wrapped in 0x0c frames:
+| Command | Value | Description |
+|---------|-------|-------------|
+| CmdDiscoReq | 0x0601 | Discovery request |
+| CmdDiscoRes | 0x0602 | Discovery response |
+| CmdSessionReq | 0x0402 | Session request |
+| CmdSessionRes | 0x0404 | Session response |
+| CmdDataTX | 0x0407 | Data transmission |
+| CmdDataRX | 0x0408 | Data reception |
+| CmdKeepaliveReq | 0x0427 | Keepalive request |
+| CmdKeepaliveRes | 0x0428 | Keepalive response |
 
-```
-Offset  Size  Field           Value/Description
-------  ----  -----           -----------------
-0-1     2     Magic           0x000c
-2-3     2     Version         0x000b
-4-7     4     AVSequence      Global sequence (increments)
-8-15    8     Reserved        0x00...
-16-17   2     ChannelType     0x7000
-18-19   2     SubChannel      0x0000 (K10000) or 0x0001 (K10002)
-20-23   4     IOCTLSequence   Always 0x00000001
-24-27   4     PayloadSize     HL payload size + 4
-28-31   4     Flag            0x00000000 (K10000) or 0x00000001 (K10002)
-32-35   4     Reserved        0x00...
-36-37   2     IOType          0x0100
-38-39   2     Reserved        0x0000
-40+     var   HLPayload       The actual IOCTL command (HL header + data)
-```
+### 16.2 Magic Values
 
-### 0x09 ACK/Poll Message (24 bytes)
+| Magic | Value | Description |
+|-------|-------|-------------|
+| MagicAVLogin1 | 0x0000 | AV Login packet 1 |
+| MagicAVLogin2 | 0x2000 | AV Login packet 2 |
+| MagicAVLoginResp | 0x2100 | AV Login response |
+| MagicIOCtrl | 0x7000 | IOCTRL frame |
+| MagicChannelMsg | 0x1000 | Channel message |
+| MagicACK | 0x0009 | ACK frame |
 
-```
-Offset  Size  Field           Value
-------  ----  -----           -----
-0-1     2     Magic           0x0009
-2-3     2     Version         0x000b
-4-7     4     AVSequence      Global sequence
-8-11    4     Marker          0xffffffff
-12-13   2     Counter         0x0002
-14-19   6     Reserved        0x00...
-20-21   2     Field           0x062e
-22-23   2     Reserved        0x0000
-```
+### 16.3 K-Commands
 
-### 0x0b Status/Keepalive (20 bytes)
+| Command | ID | Description |
+|---------|-----|-------------|
+| KCmdAuth | 10000 | Auth request |
+| KCmdChallenge | 10001 | Challenge from camera |
+| KCmdChallengeResp | 10002 | Challenge response |
+| KCmdAuthResult | 10003 | Auth result (JSON) |
+| KCmdControlChannel | 10010 | Start/stop media |
+| KCmdControlChannelResp | 10011 | Control response |
+| KCmdSetResolution | 10056 | Set resolution/bitrate |
+| KCmdSetResolutionResp | 10057 | Resolution response |
 
-```
-Offset  Size  Field           Value
-------  ----  -----           -----
-0-1     2     Magic           0x000b
-2-3     2     Version         0x000b
-4-7     4     AVSequence      Global sequence
-8-9     2     Field1          0x03b4
-10-11   2     Field2          0x0002
-12-13   2     Field3          0x0003
-14-19   6     Reserved        0x00...
-```
+### 16.4 IOTYPE Values
 
-### 0x1000 Channel Message / 0x1100 Channel ACK (36 bytes)
+| Type | Value | Description |
+|------|-------|-------------|
+| IOTypeVideoStart | 0x01FF | Start video |
+| IOTypeVideoStop | 0x02FF | Stop video |
+| IOTypeAudioStart | 0x0300 | Start audio |
+| IOTypeAudioStop | 0x0301 | Stop audio |
+| IOTypeSpeakerStart | 0x0350 | Start intercom |
+| IOTypeSpeakerStop | 0x0351 | Stop intercom |
+| IOTypeDevInfoReq | 0x0340 | Device info request |
+| IOTypeDevInfoRes | 0x0341 | Device info response |
+| IOTypePTZCommand | 0x1001 | PTZ control |
+| IOTypeReceiveFirstFrame | 0x1002 | Request keyframe |
 
-```
-Offset  Size  Field           Value
-------  ----  -----           -----
-0-1     2     Magic           0x1000 (msg) or 0x1100 (ack)
-2-3     2     Version         0x000b
-4-7     4     Sequence        Message sequence
-8       1     ChannelID       Channel number
-9       1     Reserved        0x00
-10      1     Subtype         Message subtype
-11      1     Reserved        0x00
-12-35   24    Data            Channel-specific data
-```
+### 16.5 Protocol Constants
 
-### 0x7000 IOCTL Response Frame
-
-Camera wraps IOCTL responses (K10001, K10003) in 0x7000 frames:
-
-```
-Offset  Size  Field           Description
-------  ----  -----           -----------
-0-1     2     Magic           0x0070 (little-endian = 0x7000)
-2-3     2     Version         0x000b
-4-7     4     Sequence        Response sequence
-8-31    24    Header          Frame header info
-32+     var   HLPayload       The IOCTL response (HL header + data)
-```
+| Constant | Value | Description |
+|----------|-------|-------------|
+| DefaultPort | 32761 | TUTK discovery port |
+| ProtocolVersion | 0x000C | Version 12 |
+| DefaultCapabilities | 0x001F07FB | Standard caps |
+| MaxPacketSize | 2048 | Max UDP packet |
+| IOTCChannelMain | 0 | Main channel (DTLS client) |
+| IOTCChannelBack | 1 | Backchannel (DTLS server) |
